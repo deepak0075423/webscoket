@@ -41,6 +41,14 @@ const ALLOWED_ORIGINS     = (process.env.ALLOWED_ORIGINS || '').split(',').map(s
 if (!REDIS_URL)        { console.error('FATAL: REDIS_URL is required');        process.exit(1); }
 if (!CHAT_SERVICE_URL) { console.error('FATAL: CHAT_SERVICE_URL is required'); process.exit(1); }
 if (!INTERNAL_SECRET)  { console.error('FATAL: INTERNAL_SECRET is required');  process.exit(1); }
+// The React app and the mobile app authenticate sockets with the API's JWT.
+// Without this secret every one of those handshakes is rejected and the app
+// silently loses live chat + live notifications — so refuse to start quietly.
+if (!JWT_SECRET) {
+    console.error('FATAL: JWT_SECRET is required — it must match JWT_SECRET in the school-backend .env,');
+    console.error('       otherwise every token-authenticated socket is rejected as "Unauthenticated".');
+    process.exit(1);
+}
 
 // ── Redis clients ─────────────────────────────────────────────────────────────
 function _makeRedis(name) {
@@ -103,18 +111,29 @@ io.engine.use(sessionMiddleware);
 
 // ── Socket.io auth middleware ─────────────────────────────────────────────────
 // Accepts either a JWT token (school-backend users) or a Redis session (chat users).
-io.use((socket, next) => {
+io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
-    if (token && JWT_SECRET) {
+    if (token) {
         try {
             const decoded = jwt.verify(token, JWT_SECRET);
             socket.userId   = String(decoded.userId);
-            socket.userRole = decoded.role     || 'unknown';
-            socket.schoolId = decoded.schoolId || '';
+            socket.userRole = decoded.role     ? String(decoded.role)     : '';
+            socket.schoolId = decoded.schoolId ? String(decoded.schoolId) : '';
             socket.authType = 'jwt';
+
+            // Tokens issued before role/school were added to the payload carry
+            // only userId. Room sync and chat.send both need the school, so
+            // resolve the rest from the backend instead of joining no rooms.
+            if (!socket.userRole || !socket.schoolId) {
+                const ctx = await _getUserContext(socket.userId);
+                if (ctx) {
+                    socket.userRole = socket.userRole || ctx.role     || 'unknown';
+                    socket.schoolId = socket.schoolId || ctx.schoolId || '';
+                }
+            }
             return next();
-        } catch {
-            // fall through to session auth
+        } catch (err) {
+            console.warn(`[Gateway] token rejected (${err.message}) — trying session auth`);
         }
     }
     const sess = socket.request.session;
@@ -170,6 +189,22 @@ function _bumpLastSeen(userId) {
         headers: { 'x-internal-secret': INTERNAL_SECRET },
         signal:  AbortSignal.timeout(3000),
     }).catch(() => { /* presence is best-effort */ });
+}
+
+// Role + school for a user whose token predates those claims
+async function _getUserContext(userId) {
+    try {
+        const url = `${SCHOOL_BACKEND_URL}/internal/user-context?userId=${encodeURIComponent(userId)}`;
+        const res = await fetch(url, {
+            headers: { 'x-internal-secret': INTERNAL_SECRET },
+            signal: AbortSignal.timeout(3000),
+        });
+        if (!res.ok) return null;
+        return await res.json();
+    } catch (err) {
+        console.warn(`[Gateway] user-context lookup failed for ${userId}:`, err.message);
+        return null;
+    }
 }
 
 async function _getNotificationCount(userId) {
