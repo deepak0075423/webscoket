@@ -11,7 +11,8 @@
  *   • Authenticates sockets by reading sessions from the shared Redis session store
  *   • On connect: calls Chat Service's internal REST to get the user's room list
  *   • Subscribes to chat.deliver and chat.member channels → forwards to sockets
- *   • Forwards socket events (send/read/edit/delete) to Redis → Chat Service picks them up
+ *   • Forwards chat:send / chat:read to the Chat Service's /internal/chat/* and
+ *     acks the browser with the result; edit/delete (legacy) ride Redis
  *   • Handles typing indicators and presence entirely in-process (no DB, no Chat Service)
  *
  * Required env vars: see .env.example
@@ -116,6 +117,9 @@ io.use(async (socket, next) => {
     if (token) {
         try {
             const decoded = jwt.verify(token, JWT_SECRET);
+            // The sign-in chooser's short-lived `purpose` tokens are not sessions
+            // (the API refuses them too) — never let one open a socket.
+            if (decoded.purpose) return next(new Error('Unauthenticated — not a session token'));
             socket.userId   = String(decoded.userId);
             socket.userRole = decoded.role     ? String(decoded.role)     : '';
             socket.schoolId = decoded.schoolId ? String(decoded.schoolId) : '';
@@ -222,6 +226,26 @@ async function _getNotificationCount(userId) {
     }
 }
 
+// Chat commands (send / read) go to the backend over HTTP so the browser gets a
+// real answer: the saved message, or the reason it was refused. Fan-out to the
+// room still comes back over Redis (chat.deliver).
+async function _chatCommand(path, body) {
+    try {
+        const res = await fetch(`${CHAT_SERVICE_URL}/internal/chat/${path}`, {
+            method:  'POST',
+            headers: { 'x-internal-secret': INTERNAL_SECRET, 'content-type': 'application/json' },
+            body:    JSON.stringify(body),
+            signal:  AbortSignal.timeout(8000),
+        });
+        const out = await res.json().catch(() => null);
+        if (out && typeof out.ok === 'boolean') return out;
+        return { ok: false, status: res.status, message: 'Chat service unavailable' };
+    } catch (err) {
+        console.warn(`[Gateway] /internal/chat/${path} failed:`, err.message);
+        return { ok: false, status: 503, message: 'Chat service unavailable' };
+    }
+}
+
 // ── Redis publish helper ──────────────────────────────────────────────────────
 function _publish(channel, data) {
     pubClient.publish(channel, JSON.stringify(data)).catch((err) => {
@@ -245,7 +269,11 @@ async function _markOffline(userId, chatIds) {
 }
 
 // ── Connection handler ────────────────────────────────────────────────────────
-io.on('connection', async (socket) => {
+// Every listener is attached synchronously, BEFORE the room lookup is awaited.
+// A socket.io event that arrives while no listener exists is dropped, and the
+// moment of (re)connecting is exactly when a browser flushes the messages it
+// queued while offline — they used to vanish here.
+io.on('connection', (socket) => {
     const { userId, userRole, schoolId } = socket;
 
     _addSocket(userId, socket.id);
@@ -253,97 +281,135 @@ io.on('connection', async (socket) => {
     // Personal room — used by publishToUser() from Chat/Notification Service
     socket.join(`user:${userId}`);
 
-    // Push initial unread notification count
-    _getNotificationCount(userId).then(count => {
-        socket.emit('notification:unread_count', { count });
-    });
-
-    // Join all chat rooms the user belongs to
-    let chatIds = [];
-    try {
-        chatIds = await _getUserChats(userId, schoolId);
-        for (const chatId of chatIds) socket.join(`chat:${chatId}`);
-    } catch (err) {
-        console.error(`[Gateway] room-sync failed for user ${userId}:`, err.message);
-    }
-
-    // Mark online
-    await _markOnline(userId, chatIds);
-    _bumpLastSeen(userId);
-
     // ── Presence heartbeat (keeps Redis TTL alive + lastSeenAt fresh every 25 s) ──
     const heartbeatTimer = setInterval(() => {
         presenceRedis.set(`presence:${userId}`, '1', 'EX', 35).catch(() => {});
         _bumpLastSeen(userId);
     }, 25_000);
 
-    // ── Inbound socket events → Redis → Chat Service ──────────────────────────
+    // ── Inbound chat commands ─────────────────────────────────────────────────
+    // chat:send / chat:read take an optional ack callback. With one, the caller
+    // hears back { ok, data } or { ok:false, message } — the browser keeps its
+    // optimistic bubble pending until then and falls back to REST on a timeout
+    // (safe: the backend dedupes on clientId). Without one, a failure arrives
+    // as a chat:error event instead.
 
-    socket.on('chat:send', (data) => {
-        if (!data || !data.chatId) return;
-        _publish('chat.send', {
-            chatId:     data.chatId,
-            senderId:   userId,
-            senderRole: userRole,
-            schoolId,
-            content:    data.content,
-            type:       data.type       || 'text',
-            replyTo:    data.replyTo    || null,
-            attachments: data.attachments || [],
-            tempId:     data.tempId     || null,
-        });
-    });
+    // Token bucket per socket: bursts of 30 sends, refilled at one per 400 ms.
+    const BUCKET = 30, REFILL_MS = 400;
+    let sendTokens = BUCKET;
+    let refilledAt = Date.now();
+    const takeSendToken = () => {
+        const now = Date.now();
+        const earned = Math.floor((now - refilledAt) / REFILL_MS);
+        if (earned > 0) {
+            sendTokens = Math.min(BUCKET, sendTokens + earned);
+            refilledAt = sendTokens === BUCKET ? now : refilledAt + earned * REFILL_MS;
+        }
+        if (sendTokens <= 0) return false;
+        sendTokens -= 1;
+        return true;
+    };
 
-    socket.on('chat:read', (data) => {
-        if (!data || !data.chatId) return;
-        _publish('chat.read', {
-            chatId:    data.chatId,
+    const reply = (ack, result) => {
+        if (typeof ack === 'function') return ack(result);
+        if (!result.ok) socket.emit('chat:error', { message: result.message, clientId: result.clientId || null });
+    };
+
+    socket.on('chat:send', async (data, ack) => {
+        const clientId = data?.clientId || data?.tempId || null;
+        if (!data || !data.chatId) return reply(ack, { ok: false, status: 400, message: 'chatId is required', clientId });
+        if (!takeSendToken()) {
+            return reply(ack, { ok: false, status: 429, message: 'You are sending messages too quickly', clientId });
+        }
+        const out = await _chatCommand('send', {
             userId,
-            messageId: data.messageId || null,
+            chatId:      data.chatId,
+            content:     data.content,
+            type:        data.type || 'text',
+            replyTo:     data.replyTo || null,
+            attachments: data.attachments || [],
+            isForwarded: !!data.isForwarded,
+            clientId,
         });
+        reply(ack, out.ok ? out : { ...out, clientId });
     });
 
+    socket.on('chat:read', async (data, ack) => {
+        if (!data || !data.chatId) {
+            if (typeof ack === 'function') ack({ ok: false, status: 400, message: 'chatId is required' });
+            return;
+        }
+        const out = await _chatCommand('read', { userId, chatId: data.chatId, messageId: data.messageId || null });
+        if (typeof ack === 'function') ack(out);   // a failed read receipt is not worth a toast
+    });
+
+    // Edit / delete still ride Redis for older clients; current ones use REST.
     socket.on('chat:edit', (data) => {
         if (!data || !data.messageId || !data.content) return;
-        _publish('chat.edit', {
-            messageId: data.messageId,
-            senderId:  userId,
-            content:   data.content,
-        });
+        _publish('chat.edit', { messageId: data.messageId, senderId: userId, content: data.content });
     });
 
     socket.on('chat:delete', (data) => {
         if (!data || !data.messageId) return;
-        _publish('chat.delete', {
-            messageId:  data.messageId,
-            senderId:   userId,
-            senderRole: userRole,
-        });
+        _publish('chat.delete', { messageId: data.messageId, senderId: userId, senderRole: userRole });
     });
 
     // ── Typing indicators (handled entirely in gateway — no Chat Service round-trip) ──
-
+    // Only relayed into rooms this socket is actually in, so nobody can make a
+    // conversation they are not part of show "typing…".
     socket.on('chat:typing', ({ chatId } = {}) => {
-        if (!chatId) return;
+        if (!chatId || !socket.rooms.has(`chat:${chatId}`)) return;
         socket.to(`chat:${chatId}`).emit('chat:typing', { chatId, userId });
     });
 
     socket.on('chat:stop_typing', ({ chatId } = {}) => {
-        if (!chatId) return;
+        if (!chatId || !socket.rooms.has(`chat:${chatId}`)) return;
         socket.to(`chat:${chatId}`).emit('chat:stop_typing', { chatId, userId });
     });
 
     // ── Disconnect ────────────────────────────────────────────────────────────
+    // Rooms are emptied before 'disconnect' fires — remember them here so the
+    // offline notice also reaches conversations joined after connecting.
+    let lastRooms = [];
+    socket.on('disconnecting', () => {
+        lastRooms = [...socket.rooms].filter((r) => r.startsWith('chat:')).map((r) => r.slice(5));
+    });
+
     socket.on('disconnect', async () => {
         clearInterval(heartbeatTimer);
         _removeSocket(userId, socket.id);
 
         if (!_isOnline(userId)) {
             // Last socket for this user — announce offline + record final "last seen"
-            await _markOffline(userId, chatIds);
+            await _markOffline(userId, lastRooms);
             _bumpLastSeen(userId);
         }
     });
+
+    // ── Async setup (listeners are already live) ──────────────────────────────
+    (async () => {
+        // Push initial unread notification count
+        _getNotificationCount(userId).then(count => {
+            socket.emit('notification:unread_count', { count });
+        });
+
+        // Join all chat rooms the user belongs to
+        let chatIds = [];
+        try {
+            chatIds = await _getUserChats(userId, schoolId);
+            if (socket.connected) for (const chatId of chatIds) socket.join(`chat:${chatId}`);
+        } catch (err) {
+            console.error(`[Gateway] room-sync failed for user ${userId}:`, err.message);
+        }
+        if (!socket.connected) return;
+
+        // From here on nothing aimed at this socket's rooms can be missed — the
+        // browser catches up on anything older (REST, ?after=) when it hears this.
+        socket.emit('chat:ready', { rooms: chatIds.length });
+
+        await _markOnline(userId, chatIds);
+        _bumpLastSeen(userId);
+    })().catch((err) => console.error('[Gateway] connection setup failed:', err.message));
 });
 
 // ── Redis Pub/Sub: inbound from Chat Service & Notification Service ───────────
@@ -393,14 +459,14 @@ function _onDeliver({ target, targetId, event, data }) {
  * Called when Chat Service creates a new chat or removes a member.
  * Payload: { action: 'join'|'leave', userId, chatId }
  */
-async function _onMember({ action, userId, chatId }) {
+function _onMember({ action, userId, chatId }) {
     if (!action || !userId || !chatId) return;
-    const room    = `chat:${chatId}`;
-    const sockets = await io.in(`user:${userId}`).fetchSockets();
-    for (const s of sockets) {
-        if (action === 'join')  s.join(room);
-        if (action === 'leave') s.leave(room);
-    }
+    const room = `chat:${chatId}`;
+    // Synchronous on purpose: a new conversation's first message is often in
+    // the same Redis read as its join, and an awaited fetchSockets() let that
+    // delivery run before the join — the recipient never saw it.
+    if (action === 'join')  io.in(`user:${userId}`).socketsJoin(room);
+    if (action === 'leave') io.in(`user:${userId}`).socketsLeave(room);
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
