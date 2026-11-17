@@ -78,3 +78,4 @@ jobs:
           DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
         run: |
           ssh server "bash -s -- $(printf '%q ' "$GITHUB_SHA" ws-gateway webscoket 3020 "$DEPLOY_DIR")" < deploy/server-deploy.sh
+ 
