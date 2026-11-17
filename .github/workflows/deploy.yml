@@ -1,0 +1,80 @@
+# Deploys the realtime gateway to the EC2 server on every push to main.
+#
+#   push to main ─▶ SSH → deploy/server-deploy.sh (git → npm ci if needed → pm2 → /health)
+#
+# Repository secrets (Settings → Secrets and variables → Actions → Secrets):
+#   EC2_HOST      the server's address (13.50.231.82)
+#   EC2_USER      the login that runs pm2: ec2-user (the server runs Amazon Linux)
+#   EC2_SSH_KEY   the whole private key file (.pem), BEGIN/END lines included
+# Optional repository variable (… → Variables):
+#   DEPLOY_DIR    the server folder of this repo — only if the deploy cannot
+#                 find it from pm2 (process "ws-gateway") or git
+#
+# The gateway is one pm2 process (fork mode), so a deploy restarts it: open
+# sockets drop for a few seconds and the browsers/apps reconnect by themselves.
+# Run it by hand: Actions → Deploy gateway → Run workflow.
+# Roll back: re-run an older successful run.
+name: Deploy gateway
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # One deploy at a time; a newer push waits for the running one.
+    concurrency:
+      group: deploy-gateway
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Connect to the server
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          for v in EC2_HOST EC2_USER EC2_SSH_KEY; do
+            [ -n "${!v}" ] || { echo "::error::Repository secret $v is not set (Settings → Secrets and variables → Actions)"; exit 1; }
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # The fingerprint is public — printing it shows WHICH key the secret holds.
+          if ! pub="$(ssh-keygen -y -f ~/.ssh/deploy_key 2>/dev/null)"; then
+            echo "::error::EC2_SSH_KEY is not a usable private key — paste the whole .pem file, from the -----BEGIN line to the -----END line, with its line breaks (on the Mac: pbcopy < ~/.ssh/aksharum.pem, then paste into the secret)"
+            exit 1
+          fi
+          fp="$(printf '%s\n' "$pub" | ssh-keygen -lf - | cut -d' ' -f2)"
+          echo "EC2_SSH_KEY fingerprint: $fp"
+          if ! timeout 15 bash -c "exec 3<>/dev/tcp/$EC2_HOST/22" 2>/dev/null; then
+            echo "::error::Cannot reach $EC2_HOST on port 22 from GitHub Actions. In the EC2 security group, allow inbound SSH (port 22) from anywhere — the key still guards the login."
+            exit 1
+          fi
+          ssh-keyscan -T 15 -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config <<EOF
+          Host server
+            HostName $EC2_HOST
+            User $EC2_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            BatchMode yes
+            ConnectTimeout 20
+            ServerAliveInterval 30
+          EOF
+          if ! err="$(ssh server true 2>&1)"; then
+            echo "$err"
+            echo "::error::SSH login as $EC2_USER@$EC2_HOST was refused ($(printf '%s' "$err" | tail -1)). EC2_SSH_KEY holds key $fp — on Nov 17 2026 the server accepted only aksharum.pem, SHA256:HZLWh7d0ouwRFrbUw0w7VIMNKwZ/gMeDbuD+dgtsTw4. EC2_USER must be ec2-user."
+            exit 1
+          fi
+          echo "Connected to $EC2_USER@$EC2_HOST"
+
+      - name: Deploy on the server
+        env:
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+        run: |
+          ssh server "bash -s -- $(printf '%q ' "$GITHUB_SHA" ws-gateway webscoket 3020 "$DEPLOY_DIR")" < deploy/server-deploy.sh
